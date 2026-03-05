@@ -4,4 +4,3 @@ gunicorn==21.2.0
 requests==2.31.0
 websocket-client==1.7.0
 python-dotenv==1.0.0
-dhanhq==1.3.1
