@@ -2,7 +2,7 @@
 NiftyEdge Pro v2 — Complete Backend
 Client ID: 1108455416
 Real Dhan WebSocket live price feed + Strategy Engine
-Railway-ready
+Railway-ready + Full Session Persistence
 """
 import os, json, time, threading, struct, requests
 from datetime import datetime, time as dtime
@@ -38,12 +38,107 @@ CONFIG = {
     "TRAIL_EVERY": float(os.environ.get("TRAIL_EVERY", "500")),
 }
 
-# Dhan SecurityIDs for indices
 SECID = {"NIFTY": "13", "BANKNIFTY": "25", "FINNIFTY": "27", "VIX": "1333"}
 LOT   = {"NIFTY": 50,   "BANKNIFTY": 15,   "FINNIFTY": 40}
 
 DHAN_API = "https://api.dhan.co"
 DHAN_WS  = "wss://api-feed.dhan.co"
+
+# ════════════════════════════════════════════
+# PERSISTENCE — survives token refresh & restarts
+# ════════════════════════════════════════════
+SESSION_FILE = lambda: f"session_{datetime.now().strftime('%Y-%m-%d')}.json"
+TRADES_FILE  = lambda: f"trades_{datetime.now().strftime('%Y-%m-%d')}.json"
+
+def save_session():
+    """Write critical state to disk. Called after every trade and every 5 alerts."""
+    try:
+        data = {
+            "date":          datetime.now().strftime("%Y-%m-%d"),
+            "gross_win":     STATE["gross_win"],
+            "gross_loss":    STATE["gross_loss"],
+            "daily_loss":    STATE["daily_loss"],
+            "signals_count": STATE["signals_count"],
+            "blocked_count": STATE["blocked_count"],
+            "skipped_count": STATE["skipped_count"],
+            "or_high":       STATE["or_high"],
+            "or_low":        STATE["or_low"],
+            "or_fetched":    STATE["or_fetched"],
+            "alerts":        STATE["alerts"][:40],
+            "position":      STATE["position"],
+            "signal":        STATE["signal"],
+            "entry_price":   STATE["entry_price"],
+            "sl_price":      STATE["sl_price"],
+            "target_price":  STATE["target_price"],
+            "trail_high":    STATE["trail_high"],
+            "saved_at":      datetime.now().strftime("%H:%M:%S"),
+        }
+        with open(SESSION_FILE(), "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[PERSIST] save_session failed: {e}")
+
+def save_trade(trade):
+    """Immediately append a closed trade to today's trade file."""
+    try:
+        trades = []
+        tf = TRADES_FILE()
+        if os.path.exists(tf):
+            with open(tf) as f:
+                trades = json.load(f)
+        trades.append(trade)
+        with open(tf, "w") as f:
+            json.dump(trades, f, indent=2)
+    except Exception as e:
+        print(f"[PERSIST] save_trade failed: {e}")
+
+def load_session():
+    """
+    On startup: restore today's session from disk.
+    Token refresh / server restart / Railway sleep = zero data loss.
+    Previous day's file is never touched — new date = fresh start.
+    """
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        sf = SESSION_FILE()
+        tf = TRADES_FILE()
+
+        if os.path.exists(sf):
+            with open(sf) as f:
+                data = json.load(f)
+
+            if data.get("date") == today:
+                STATE["gross_win"]     = data.get("gross_win", 0)
+                STATE["gross_loss"]    = data.get("gross_loss", 0)
+                STATE["daily_loss"]    = data.get("daily_loss", 0)
+                STATE["signals_count"] = data.get("signals_count", 0)
+                STATE["blocked_count"] = data.get("blocked_count", 0)
+                STATE["skipped_count"] = data.get("skipped_count", 0)
+                STATE["or_high"]       = data.get("or_high")
+                STATE["or_low"]        = data.get("or_low")
+                STATE["or_fetched"]    = bool(data.get("or_fetched", False))
+                STATE["alerts"]        = data.get("alerts", [])
+                # Restore open position if any was active
+                pos = data.get("position")
+                if pos:
+                    STATE["position"]     = pos
+                    STATE["signal"]       = data.get("signal")
+                    STATE["entry_price"]  = data.get("entry_price", 0)
+                    STATE["sl_price"]     = data.get("sl_price", 0)
+                    STATE["target_price"] = data.get("target_price", 0)
+                    STATE["trail_high"]   = data.get("trail_high", 0)
+                pnl = STATE["gross_win"] - STATE["gross_loss"]
+                print(f"[PERSIST] ✅ Session restored — P&L:₹{pnl:.0f} | Signals:{STATE['signals_count']}")
+                add_alert("success",
+                    f"Session restored — P&L:₹{pnl:.0f} | OR:{STATE['or_high']}/{STATE['or_low']}")
+
+        if os.path.exists(tf):
+            with open(tf) as f:
+                STATE["trades"] = json.load(f)
+            print(f"[PERSIST] ✅ {len(STATE['trades'])} trades restored from disk.")
+
+    except Exception as e:
+        print(f"[PERSIST] load_session failed (fresh start): {e}")
 
 # ════════════════════════════════════════════
 # STATE
@@ -136,7 +231,7 @@ def calc_or():
     STATE["or_high"] = max(c["h"] for c in cs)
     STATE["or_low"]  = min(c["l"] for c in cs)
     rng = round(STATE["or_high"]-STATE["or_low"], 2)
-    add_alert("success", f"OR from real candles — H:{STATE['or_high']} L:{STATE['or_low']} Rng:{rng}pts")
+    add_alert("success", f"OR set — H:{STATE['or_high']} L:{STATE['or_low']} Rng:{rng}pts")
     return True
 
 def nearest_expiry():
@@ -297,25 +392,21 @@ def strategy_loop():
         now = datetime.now()
         t   = now.time()
 
-        # Fetch prev close once
         if not STATE["nifty_prev"] and STATE["token_valid"]:
             fetch_prev_close()
 
-        # Calculate OR at 9:30
         if not STATE["or_fetched"] and t >= dtime(9,30):
             if fetch_15min_candles() and calc_or():
                 STATE["or_fetched"] = True
             else:
                 add_alert("warn", "Candle data not ready yet…")
 
-        # Not in trade window
         if not time_ok():
             if t >= dtime(15,15) and STATE["position"]:
                 _eod_close()
             time.sleep(10)
             continue
 
-        # Broad filters
         if not gap_ok():
             add_alert("warn", "GAP filter active — no trades.")
             time.sleep(60); continue
@@ -323,12 +414,10 @@ def strategy_loop():
             add_alert("warn", f"VIX {STATE['vix']:.1f} — outside range.")
             time.sleep(30); continue
 
-        # Monitor open position
         if STATE["position"]:
             _monitor()
             time.sleep(3); continue
 
-        # Detect sweep
         if STATE["or_high"] and not STATE["signal"]:
             price = STATE["nifty"]
             if price > STATE["or_high"] and STATE["sweep_dir"] != "SWEEP_UP":
@@ -348,7 +437,6 @@ def strategy_loop():
                 )
                 if returned:
                     sig = "PE" if STATE["sweep_dir"]=="SWEEP_UP" else "CE"
-                    # Volume check
                     cs = STATE["candles_15m"]
                     vol_ok = True
                     if len(cs) >= 3:
@@ -393,7 +481,8 @@ def _execute(sig):
     if order:
         STATE.update({
             "signal": sig, "entry_price": ltp, "sl_price": sl,
-            "target_price": tgt, "trail_high": ltp, "signals_count": STATE["signals_count"]+1,
+            "target_price": tgt, "trail_high": ltp,
+            "signals_count": STATE["signals_count"]+1,
             "position": {
                 "symbol": f"{CONFIG['INDEX']}{opt['strike']}{sig}",
                 "type": sig, "strike": opt["strike"], "qty": qty,
@@ -403,6 +492,7 @@ def _execute(sig):
                 "entry_time": datetime.now().strftime("%H:%M"),
             }
         })
+        save_session()   # save immediately when position opens
         _rsweep()
 
 def _monitor():
@@ -414,7 +504,6 @@ def _monitor():
     else:
         cur = get_atm_option(pos["type"]).get("ltp", STATE["entry_price"])
 
-    # Trailing SL
     if cur > STATE["trail_high"]:
         STATE["trail_high"] = cur
         profit = STATE["trail_high"] - STATE["entry_price"]
@@ -434,20 +523,38 @@ def _close(exit_px, reason):
     if not pos: return
     place_order(pos["security_id"], "SELL", pos["qty"])
     pnl = round((exit_px - pos["entry"]) * pos["qty"], 2)
-    STATE["trades"].insert(0, {
-        "time": pos["entry_time"], "exit_time": datetime.now().strftime("%H:%M"),
-        "type": pos["type"], "strike": pos["strike"],
-        "entry": pos["entry"], "exit": exit_px,
-        "lots": CONFIG["LOTS"], "pnl": pnl, "reason": reason, "mode": CONFIG["MODE"],
-    })
+
+    trade_record = {
+        "time":      pos["entry_time"],
+        "exit_time": datetime.now().strftime("%H:%M"),
+        "type":      pos["type"],
+        "strike":    pos["strike"],
+        "entry":     pos["entry"],
+        "exit":      exit_px,
+        "lots":      CONFIG["LOTS"],
+        "pnl":       pnl,
+        "reason":    reason,
+        "mode":      CONFIG["MODE"],
+    }
+    STATE["trades"].insert(0, trade_record)
     STATE["trades"] = STATE["trades"][:50]
-    if pnl >= 0: STATE["gross_win"] += pnl
+
+    # ── PERSIST: write trade to disk immediately ──
+    save_trade(trade_record)
+
+    if pnl >= 0:
+        STATE["gross_win"] += pnl
     else:
         STATE["gross_loss"] += abs(pnl)
         STATE["daily_loss"] += abs(pnl)
+
     add_alert("success" if pnl>=0 else "danger",
         f"{reason} | Exit:₹{exit_px} | P&L:{'+' if pnl>=0 else ''}₹{pnl}")
+
     STATE.update({"position":None,"signal":None,"entry_price":0})
+
+    # ── PERSIST: save full session after close ──
+    save_session()
 
 def _eod_close():
     if STATE["position"]:
@@ -462,9 +569,16 @@ def _rsweep():
 # ALERTS
 # ════════════════════════════════════════════
 def add_alert(level, msg):
-    STATE["alerts"].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg})
+    STATE["alerts"].insert(0, {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "level": level,
+        "msg": msg,
+    })
     STATE["alerts"] = STATE["alerts"][:40]
     print(f"[{level.upper()}] {msg}")
+    # ── PERSIST: save every 5 alerts ──
+    if len(STATE["alerts"]) % 5 == 0:
+        save_session()
 
 # ════════════════════════════════════════════
 # ROUTES
@@ -514,7 +628,8 @@ def stop():
 
 @app.route("/api/square_off", methods=["POST"])
 def sq():
-    _eod_close(); return jsonify({"status":"squared_off"})
+    _eod_close()
+    return jsonify({"status":"squared_off"})
 
 @app.route("/api/config", methods=["GET","POST"])
 def cfg():
@@ -532,7 +647,12 @@ def reset():
               "blocked_count","skipped_count","entry_price"]: STATE[k]=0
     for k in ["or_high","or_low","sweep_dir","signal","position"]: STATE[k]=None
     STATE["or_fetched"]=False; STATE["sweep_candles"]=0
-    add_alert("info","Session reset.")
+    # Also wipe today's files so reset is complete
+    for f in [SESSION_FILE(), TRADES_FILE()]:
+        try:
+            if os.path.exists(f): os.remove(f)
+        except: pass
+    add_alert("info","Session reset — disk files cleared.")
     return jsonify({"status":"reset"})
 
 @app.route("/api/health")
@@ -540,12 +660,46 @@ def health():
     return jsonify({"status":"ok","ws":STATE["ws_connected"],"token":STATE["token_valid"],
                     "nifty":STATE["nifty"],"last_tick":STATE["last_tick"],"mode":CONFIG["MODE"]})
 
+@app.route("/api/session/export")
+def export_session():
+    """Download today's complete trade log as JSON."""
+    tf = TRADES_FILE()
+    trades = []
+    if os.path.exists(tf):
+        with open(tf) as f:
+            trades = json.load(f)
+    wins  = [t for t in trades if t.get("pnl",0) > 0]
+    losses= [t for t in trades if t.get("pnl",0) <= 0]
+    return jsonify({
+        "date":   datetime.now().strftime("%Y-%m-%d"),
+        "trades": trades,
+        "summary": {
+            "total_trades": len(trades),
+            "wins":         len(wins),
+            "losses":       len(losses),
+            "win_rate":     round(len(wins)/len(trades)*100,1) if trades else 0,
+            "gross_win":    round(sum(t["pnl"] for t in wins), 2),
+            "gross_loss":   round(sum(t["pnl"] for t in losses), 2),
+            "net_pnl":      round(sum(t.get("pnl",0) for t in trades), 2),
+        }
+    })
+
+@app.route("/api/session/save", methods=["POST"])
+def force_save():
+    """Manually trigger a session save — use if you want to be sure."""
+    save_session()
+    return jsonify({"status":"saved","time":datetime.now().strftime("%H:%M:%S")})
+
 # ════════════════════════════════════════════
 # STARTUP
 # ════════════════════════════════════════════
 def startup():
     print(f"\n{'='*48}\n  NiftyEdge Pro v2 | Client: {CONFIG['CLIENT_ID']}\n"
           f"  Mode:{CONFIG['MODE']} | Token:{'SET ✅' if CONFIG['TOKEN'] else 'MISSING ❌'}\n{'='*48}\n")
+
+    # ── PERSIST: restore today's session before anything else ──
+    load_session()
+
     if CONFIG["TOKEN"]:
         if validate_token():
             feed.start()
