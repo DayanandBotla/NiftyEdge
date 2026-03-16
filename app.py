@@ -3,9 +3,10 @@ NiftyEdge Pro v2 — Complete Backend
 Client ID: 1108455416
 Real Dhan WebSocket live price feed + Strategy Engine
 Railway-ready + Full Session Persistence
+IST timezone fixed — Railway runs UTC, all times converted to UTC+5:30
 """
 import os, json, time, threading, struct, requests
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
 from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
 
@@ -17,6 +18,35 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
+
+# ════════════════════════════════════════════
+# IST TIMEZONE UTILS
+# Railway server runs UTC — NEVER use datetime.now() directly.
+# Always use now_ist() so that session files, ORB windows,
+# time filters, alert timestamps are all correct Indian time.
+# ════════════════════════════════════════════
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist() -> datetime:
+    """Current datetime in IST (UTC+5:30). Use everywhere instead of datetime.now()."""
+    return datetime.now(_IST)
+
+def today_ist() -> str:
+    """Today's date string in IST — used for session/trade filenames."""
+    return now_ist().strftime("%Y-%m-%d")
+
+def time_ist() -> dtime:
+    """Current time-of-day in IST — used for market session checks."""
+    return now_ist().time()
+
+def hhmm_ist() -> str:
+    """HH:MM string in IST — used for position entry/exit timestamps."""
+    return now_ist().strftime("%H:%M")
+
+def hhmmss_ist() -> str:
+    """HH:MM:SS string in IST — used for alert timestamps and last_tick."""
+    return now_ist().strftime("%H:%M:%S")
+
 
 # ════════════════════════════════════════════
 # CONFIG
@@ -46,15 +76,17 @@ DHAN_WS  = "wss://api-feed.dhan.co"
 
 # ════════════════════════════════════════════
 # PERSISTENCE — survives token refresh & restarts
+# Uses today_ist() so filenames are always IST date,
+# not UTC date (which flips at 18:30 IST — mid-session!)
 # ════════════════════════════════════════════
-SESSION_FILE = lambda: f"session_{datetime.now().strftime('%Y-%m-%d')}.json"
-TRADES_FILE  = lambda: f"trades_{datetime.now().strftime('%Y-%m-%d')}.json"
+SESSION_FILE = lambda: f"session_{today_ist()}.json"   # FIXED: was datetime.now()
+TRADES_FILE  = lambda: f"trades_{today_ist()}.json"    # FIXED: was datetime.now()
 
 def save_session():
     """Write critical state to disk. Called after every trade and every 5 alerts."""
     try:
         data = {
-            "date":          datetime.now().strftime("%Y-%m-%d"),
+            "date":          today_ist(),                        # FIXED
             "gross_win":     STATE["gross_win"],
             "gross_loss":    STATE["gross_loss"],
             "daily_loss":    STATE["daily_loss"],
@@ -71,7 +103,7 @@ def save_session():
             "sl_price":      STATE["sl_price"],
             "target_price":  STATE["target_price"],
             "trail_high":    STATE["trail_high"],
-            "saved_at":      datetime.now().strftime("%H:%M:%S"),
+            "saved_at":      hhmmss_ist(),                       # FIXED
         }
         with open(SESSION_FILE(), "w") as f:
             json.dump(data, f, indent=2)
@@ -97,9 +129,10 @@ def load_session():
     On startup: restore today's session from disk.
     Token refresh / server restart / Railway sleep = zero data loss.
     Previous day's file is never touched — new date = fresh start.
+    Uses today_ist() so the date check is IST not UTC.
     """
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_ist()                                      # FIXED
         sf = SESSION_FILE()
         tf = TRADES_FILE()
 
@@ -185,7 +218,7 @@ def validate_token():
 
 def fetch_prev_close():
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_ist()                                      # FIXED
         payload = {"securityId": SECID.get(CONFIG["INDEX"],"13"),
                    "exchangeSegment":"IDX_I","instrument":"INDEX",
                    "expiryCode":0,"oi":False,"fromDate":today,"toDate":today}
@@ -200,7 +233,7 @@ def fetch_prev_close():
 
 def fetch_15min_candles():
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_ist()                                      # FIXED
         payload = {"securityId": SECID.get(CONFIG["INDEX"],"13"),
                    "exchangeSegment":"IDX_I","instrument":"INDEX",
                    "interval":"15","oi":False,"fromDate":today,"toDate":today}
@@ -236,7 +269,7 @@ def calc_or():
 
 def nearest_expiry():
     from datetime import timedelta
-    today = datetime.now()
+    today = now_ist()                                            # FIXED: was datetime.now()
     d = (3 - today.weekday()) % 7
     if d == 0 and today.hour >= 15: d = 7
     return (today + timedelta(days=d)).strftime("%Y-%m-%d")
@@ -316,7 +349,7 @@ class DhanFeed:
                 STATE["banknifty"] = round(ltp,2)
             elif sid == SECID["VIX"]:
                 STATE["vix"] = round(ltp,2)
-            STATE["last_tick"] = datetime.now().strftime("%H:%M:%S")
+            STATE["last_tick"] = hhmmss_ist()                   # FIXED: was datetime.now()
         except: pass
 
     def _parse(self, msg):
@@ -374,7 +407,7 @@ def trend_ok(sig):
     return STATE["nifty"] > STATE["ema15"] if sig=="CE" else STATE["nifty"] < STATE["ema15"]
 
 def time_ok():
-    n = datetime.now().time()
+    n = time_ist()                                               # FIXED: was datetime.now().time()
     return (dtime(9,30)<=n<=dtime(11,30)) or (dtime(14,15)<=n<=dtime(14,45))
 
 def limit_ok():
@@ -389,8 +422,8 @@ def all_ok(sig):
 def strategy_loop():
     add_alert("info", "Strategy engine started.")
     while STATE["strategy_on"]:
-        now = datetime.now()
-        t   = now.time()
+        now = now_ist()                                          # FIXED: was datetime.now()
+        t   = now.time()                                        # now IST time-of-day
 
         if not STATE["nifty_prev"] and STATE["token_valid"]:
             fetch_prev_close()
@@ -489,10 +522,10 @@ def _execute(sig):
                 "entry": ltp, "sl": sl, "target": tgt,
                 "security_id": opt["security_id"],
                 "order_id": order.get("orderId","SIM"),
-                "entry_time": datetime.now().strftime("%H:%M"),
+                "entry_time": hhmm_ist(),                        # FIXED: was datetime.now()
             }
         })
-        save_session()   # save immediately when position opens
+        save_session()
         _rsweep()
 
 def _monitor():
@@ -526,7 +559,7 @@ def _close(exit_px, reason):
 
     trade_record = {
         "time":      pos["entry_time"],
-        "exit_time": datetime.now().strftime("%H:%M"),
+        "exit_time": hhmm_ist(),                                 # FIXED: was datetime.now()
         "type":      pos["type"],
         "strike":    pos["strike"],
         "entry":     pos["entry"],
@@ -539,7 +572,6 @@ def _close(exit_px, reason):
     STATE["trades"].insert(0, trade_record)
     STATE["trades"] = STATE["trades"][:50]
 
-    # ── PERSIST: write trade to disk immediately ──
     save_trade(trade_record)
 
     if pnl >= 0:
@@ -553,7 +585,6 @@ def _close(exit_px, reason):
 
     STATE.update({"position":None,"signal":None,"entry_price":0})
 
-    # ── PERSIST: save full session after close ──
     save_session()
 
 def _eod_close():
@@ -570,13 +601,12 @@ def _rsweep():
 # ════════════════════════════════════════════
 def add_alert(level, msg):
     STATE["alerts"].insert(0, {
-        "time": datetime.now().strftime("%H:%M:%S"),
+        "time":  hhmmss_ist(),                                   # FIXED: was datetime.now()
         "level": level,
-        "msg": msg,
+        "msg":   msg,
     })
     STATE["alerts"] = STATE["alerts"][:40]
     print(f"[{level.upper()}] {msg}")
-    # ── PERSIST: save every 5 alerts ──
     if len(STATE["alerts"]) % 5 == 0:
         save_session()
 
@@ -647,7 +677,6 @@ def reset():
               "blocked_count","skipped_count","entry_price"]: STATE[k]=0
     for k in ["or_high","or_low","sweep_dir","signal","position"]: STATE[k]=None
     STATE["or_fetched"]=False; STATE["sweep_candles"]=0
-    # Also wipe today's files so reset is complete
     for f in [SESSION_FILE(), TRADES_FILE()]:
         try:
             if os.path.exists(f): os.remove(f)
@@ -671,7 +700,7 @@ def export_session():
     wins  = [t for t in trades if t.get("pnl",0) > 0]
     losses= [t for t in trades if t.get("pnl",0) <= 0]
     return jsonify({
-        "date":   datetime.now().strftime("%Y-%m-%d"),
+        "date":   today_ist(),                                   # FIXED: was datetime.now()
         "trades": trades,
         "summary": {
             "total_trades": len(trades),
@@ -688,16 +717,16 @@ def export_session():
 def force_save():
     """Manually trigger a session save — use if you want to be sure."""
     save_session()
-    return jsonify({"status":"saved","time":datetime.now().strftime("%H:%M:%S")})
+    return jsonify({"status":"saved","time":hhmmss_ist()})     # FIXED: was datetime.now()
 
 # ════════════════════════════════════════════
 # STARTUP
 # ════════════════════════════════════════════
 def startup():
     print(f"\n{'='*48}\n  NiftyEdge Pro v2 | Client: {CONFIG['CLIENT_ID']}\n"
-          f"  Mode:{CONFIG['MODE']} | Token:{'SET ✅' if CONFIG['TOKEN'] else 'MISSING ❌'}\n{'='*48}\n")
+          f"  Mode:{CONFIG['MODE']} | Token:{'SET ✅' if CONFIG['TOKEN'] else 'MISSING ❌'}\n"
+          f"  IST Time: {hhmmss_ist()}\n{'='*48}\n")   # FIXED + shows IST on boot
 
-    # ── PERSIST: restore today's session before anything else ──
     load_session()
 
     if CONFIG["TOKEN"]:
