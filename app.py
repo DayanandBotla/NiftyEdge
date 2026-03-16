@@ -49,11 +49,130 @@ def hhmmss_ist() -> str:
 
 
 # ════════════════════════════════════════════
+# TOKEN MANAGEMENT
+# Priority order (highest → lowest):
+#   1. dhan_token.txt  — writable file, updated via /api/token/update
+#   2. .env file       — loaded via python-dotenv if present locally
+#   3. DHAN_TOKEN env  — Railway environment variable (needs redeploy to change)
+#   4. Empty string    — runs in simulation mode
+#
+# HOW TO REFRESH WITHOUT REDEPLOY:
+#   POST /api/token/update  {"token": "your_new_token"}
+#   → saves to dhan_token.txt + reconnects WebSocket instantly
+# ════════════════════════════════════════════
+TOKEN_FILE = "dhan_token.txt"   # persists on Railway disk within same deployment
+
+def _load_dotenv_token() -> str:
+    """Try to read DHAN_TOKEN from a local .env file (useful for local dev)."""
+    try:
+        if os.path.exists(".env"):
+            with open(".env") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("DHAN_TOKEN=") and not line.startswith("#"):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val:
+                            return val
+    except Exception:
+        pass
+    return ""
+
+def load_token() -> str:
+    """
+    Load token from best available source.
+    Called on startup AND every time token needs refreshing.
+    Returns the token string (empty string if none found).
+    """
+    # Source 1: writable token file (updated via UI/API — no redeploy needed)
+    try:
+        if os.path.exists(TOKEN_FILE):
+            with open(TOKEN_FILE) as f:
+                tok = f.read().strip()
+            if tok:
+                print(f"[TOKEN] ✅ Loaded from {TOKEN_FILE}")
+                return tok
+    except Exception as e:
+        print(f"[TOKEN] token file read error: {e}")
+
+    # Source 2: .env file (local development)
+    tok = _load_dotenv_token()
+    if tok:
+        print("[TOKEN] ✅ Loaded from .env file")
+        return tok
+
+    # Source 3: Railway / system environment variable
+    tok = os.environ.get("DHAN_TOKEN", "").strip()
+    if tok:
+        print("[TOKEN] ✅ Loaded from DHAN_TOKEN env var")
+        return tok
+
+    print("[TOKEN] ⚠️  No token found in any source — simulation mode")
+    return ""
+
+def save_token(token: str) -> bool:
+    """Persist token to dhan_token.txt so it survives without redeployment."""
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(token.strip())
+        print(f"[TOKEN] ✅ Saved to {TOKEN_FILE}")
+        return True
+    except Exception as e:
+        print(f"[TOKEN] ❌ Save failed: {e}")
+        return False
+
+def apply_token(token: str):
+    """
+    Hot-swap token in CONFIG + reconnect WebSocket — zero downtime.
+    Called by /api/token/update and the background token watchdog.
+    """
+    token = token.strip()
+    CONFIG["TOKEN"] = token
+    save_token(token)
+    # Reconnect WebSocket with new token
+    if feed.alive:
+        feed.stop()
+        time.sleep(1)
+    if token:
+        STATE["token_valid"] = False
+        if validate_token():
+            feed.start()
+            time.sleep(1)
+            fetch_prev_close()
+    else:
+        STATE["token_valid"] = False
+        add_alert("danger", "Empty token applied — disconnected.")
+
+def token_watchdog():
+    """
+    Background thread: every 30 min checks if token file was updated externally
+    (e.g., you manually edited dhan_token.txt via Railway shell).
+    Also auto-retries validation if token is currently invalid.
+    """
+    last_mtime = 0
+    while True:
+        time.sleep(1800)  # check every 30 minutes
+        try:
+            # Check if token file was modified since last check
+            if os.path.exists(TOKEN_FILE):
+                mtime = os.path.getmtime(TOKEN_FILE)
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    new_tok = load_token()
+                    if new_tok and new_tok != CONFIG["TOKEN"]:
+                        add_alert("info", "Token file changed — reloading automatically.")
+                        apply_token(new_tok)
+            # If currently invalid, retry silently
+            if not STATE["token_valid"] and CONFIG["TOKEN"]:
+                validate_token()
+        except Exception as e:
+            print(f"[WATCHDOG] error: {e}")
+
+# ════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════
 CONFIG = {
     "CLIENT_ID":   "1108455416",
-    "TOKEN":       os.environ.get("DHAN_TOKEN", ""),
+    "TOKEN":       load_token(),   # multi-source: file → .env → env var
     "MODE":        os.environ.get("TRADE_MODE", "paper"),
     "INDEX":       os.environ.get("INDEX", "NIFTY"),
     "LOTS":        int(os.environ.get("LOTS", "1")),
@@ -200,7 +319,7 @@ def hdrs():
 def validate_token():
     if not CONFIG["TOKEN"]:
         STATE["token_valid"] = False
-        add_alert("danger", "No DHAN_TOKEN set. Add it to Railway Variables.")
+        add_alert("danger", "No token found. POST /api/token/update or add DHAN_TOKEN env var.")
         return False
     try:
         r = requests.get(f"{DHAN_API}/v2/fundlimit", headers=hdrs(), timeout=5)
@@ -209,7 +328,7 @@ def validate_token():
             add_alert("success", f"Token valid — Dhan connected. Client:{CONFIG['CLIENT_ID']}")
             return True
         STATE["token_valid"] = False
-        add_alert("danger", f"Token invalid (HTTP {r.status_code}). Update DHAN_TOKEN in Railway.")
+        add_alert("danger", f"Token expired (HTTP {r.status_code}). Use /api/token/update to refresh without redeploy.")
         return False
     except Exception as e:
         STATE["token_valid"] = False
@@ -689,6 +808,86 @@ def health():
     return jsonify({"status":"ok","ws":STATE["ws_connected"],"token":STATE["token_valid"],
                     "nifty":STATE["nifty"],"last_tick":STATE["last_tick"],"mode":CONFIG["MODE"]})
 
+@app.route("/api/token/update", methods=["POST"])
+def token_update():
+    """
+    Hot-swap the Dhan access token without any redeployment.
+    Saves to dhan_token.txt + instantly reconnects WebSocket.
+
+    Usage:
+      curl -X POST https://your-app.railway.app/api/token/update \
+           -H "Content-Type: application/json" \
+           -d '{"token": "your_new_dhan_token_here"}'
+
+    Or from your dashboard JS:
+      fetch('/api/token/update', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({token: newToken})})
+    """
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"status": "error", "msg": "token field is required"}), 400
+    if len(token) < 20:
+        return jsonify({"status": "error", "msg": "Token too short — check you pasted the full token"}), 400
+
+    add_alert("info", f"Token update received — reconnecting… (len:{len(token)})")
+
+    # Run in background so HTTP response returns immediately
+    threading.Thread(target=apply_token, args=(token,), daemon=True).start()
+
+    return jsonify({
+        "status":  "applying",
+        "msg":     "Token saved and WebSocket reconnecting. Check /api/token/status in 3s.",
+        "saved_to": TOKEN_FILE,
+        "length":  len(token),
+    })
+
+@app.route("/api/token/status", methods=["GET"])
+def token_status():
+    """Check current token status and which source it came from."""
+    tok = CONFIG["TOKEN"]
+    source = "none"
+    if tok:
+        if os.path.exists(TOKEN_FILE):
+            try:
+                with open(TOKEN_FILE) as f:
+                    if f.read().strip() == tok:
+                        source = f"file ({TOKEN_FILE})"
+            except: pass
+        if source == "none":
+            if _load_dotenv_token() == tok:
+                source = ".env file"
+            elif os.environ.get("DHAN_TOKEN","") == tok:
+                source = "env var (DHAN_TOKEN)"
+            else:
+                source = "memory only"
+
+    return jsonify({
+        "token_valid":   STATE["token_valid"],
+        "ws_connected":  STATE["ws_connected"],
+        "token_set":     bool(tok),
+        "token_preview": f"{tok[:8]}…{tok[-4:]}" if len(tok) > 12 else ("set" if tok else "not set"),
+        "token_length":  len(tok),
+        "source":        source,
+        "token_file_exists": os.path.exists(TOKEN_FILE),
+        "hint": "POST /api/token/update with {\"token\":\"...\"} to refresh without redeploy",
+    })
+
+@app.route("/api/token/clear", methods=["POST"])
+def token_clear():
+    """Remove saved token file (reverts to env var on next restart)."""
+    try:
+        if os.path.exists(TOKEN_FILE):
+            os.remove(TOKEN_FILE)
+        CONFIG["TOKEN"] = os.environ.get("DHAN_TOKEN", "")
+        STATE["token_valid"] = False
+        feed.stop()
+        add_alert("warn", "Token file cleared — reverted to env var.")
+        return jsonify({"status": "cleared"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)}), 500
+
 @app.route("/api/session/export")
 def export_session():
     """Download today's complete trade log as JSON."""
@@ -725,7 +924,11 @@ def force_save():
 def startup():
     print(f"\n{'='*48}\n  NiftyEdge Pro v2 | Client: {CONFIG['CLIENT_ID']}\n"
           f"  Mode:{CONFIG['MODE']} | Token:{'SET ✅' if CONFIG['TOKEN'] else 'MISSING ❌'}\n"
-          f"  IST Time: {hhmmss_ist()}\n{'='*48}\n")   # FIXED + shows IST on boot
+          f"  Token source: file={os.path.exists(TOKEN_FILE)} | env={bool(os.environ.get('DHAN_TOKEN'))}\n"
+          f"  IST Time: {hhmmss_ist()}\n{'='*48}\n")
+
+    # Start background token watchdog (auto-reloads if file changes)
+    threading.Thread(target=token_watchdog, daemon=True).start()
 
     load_session()
 
@@ -735,7 +938,8 @@ def startup():
             time.sleep(2)
             fetch_prev_close()
     else:
-        add_alert("danger","DHAN_TOKEN missing — add to Railway Variables. Running simulation.")
+        add_alert("danger",
+            "No token found. POST /api/token/update or set DHAN_TOKEN env var. Running simulation.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
